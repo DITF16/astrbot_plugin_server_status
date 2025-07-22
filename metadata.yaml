@@ -1,5 +1,5 @@
 name: astrbot_plugin_server_status
-description: "通过群名片显示服务器状态插件"
+description: "通过群昵称动态显示服务器状态的插件"
 version: v1.0
 author: DITF16
 repo: https://github.com/DITF16/astrbot_plugin_server_status
