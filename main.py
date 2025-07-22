@@ -23,8 +23,8 @@ from astrbot.api import logger
 @register(
     "astrbot_plugin_server_status",
     "DITF16",
-    "通过群昵称动态显示服务器状态的插件",
-    "1.0",
+    "通过群昵称动态显示服务器状态的插件，并提供状态历史图生成",
+    "1.1",
     "https://github.com/DITF16/astrbot_plugin_server_status"
 )
 class ServerStatusPlugin(Star):
@@ -57,7 +57,7 @@ class ServerStatusPlugin(Star):
                 logger.info(f"成功加载字体文件: {self.font_path}")
             else:
                 logger.warning(f"字体文件未找到: {self.font_path}，图表中的中文可能显示为方块。")
-                logger.warning("请在插件数据目录中创建 /font 文件夹，并放入一个名为 font.ttf 的中文字体文件。")
+                logger.warning("请在插件目录中创建 /font 文件夹，并放入一个名为 font.ttf 的中文字体文件。")
 
             self._sync_load_config()
             logger.info(f"成功加载显示模式配置，当前模式: {self.display_mode}")
@@ -158,6 +158,27 @@ class ServerStatusPlugin(Star):
         except Exception as e:
             logger.error(f"处理群 {group_id} 昵称更新时发生错误: {e}")
 
+    async def cleanup_nickname_suffix(self, client, group_id: str, self_id: int):
+        """检查并清理非目标群聊的昵称后缀"""
+        try:
+            info_payload = {"group_id": int(group_id), "user_id": self_id}
+            member_info = await client.api.call_action('get_group_member_info', **info_payload)
+            current_card = member_info.get('card', '')
+
+            if not current_card:
+                return
+
+            match = re.search(r"(\s*\(理智使用.*?\s*脑容量使用.*?\))$", current_card)
+            if match:
+                new_card = current_card[:match.start()].rstrip()
+                if new_card == current_card:
+                    return
+                set_payload = {"group_id": int(group_id), "user_id": self_id, "card": new_card}
+                await client.api.call_action('set_group_card', **set_payload)
+                logger.info(f"成功为非目标群 {group_id} 清理了昵称后缀。")
+        except Exception as e:
+            logger.error(f"为群 {group_id} 清理昵称时发生错误: {e}")
+
     async def scheduled_db_record(self):
         logger.info("执行定时数据库记录...")
         stats = await self.get_system_stats()
@@ -176,19 +197,21 @@ class ServerStatusPlugin(Star):
             return
 
         group_id = event.get_group_id()
-        if group_id not in self.target_groups:
-            return
 
         now = datetime.now()
         last_update = self.group_last_update_time.get(group_id)
         if last_update and (now - last_update) < timedelta(minutes=5):
             return
 
-        logger.info(f"群 {group_id} 消息触发昵称更新 (冷却时间已过)。")
+        logger.info(f"群 {group_id} 消息触发状态更新检查 (冷却时间已过)。")
         self.group_last_update_time[group_id] = now
 
         stats = await self.get_system_stats()
-        await self.update_nickname_for_group(client, group_id, self_id, stats)
+
+        if group_id in self.target_groups:
+            await self.update_nickname_for_group(client, group_id, self_id, stats)
+        else:
+            await self.cleanup_nickname_suffix(client, group_id, self_id)
 
     async def scheduled_db_cleanup(self):
         try:
@@ -206,39 +229,87 @@ class ServerStatusPlugin(Star):
             conn.commit()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("大脑开启")
+    @filter.command("昵称显示开启")
     async def brain_on(self, event: AstrMessageEvent, group_id: str):
         if not group_id.isdigit():
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
         if group_id in self.target_groups:
-            yield event.plain_result(f"群 {group_id} 已在监控列表中，无需重复添加。")
+            yield event.plain_result(f"群 {group_id} 已在昵称显示列表中，无需重复添加。")
             return
 
         self.target_groups.add(group_id)
         await self._save_groups()
-        logger.info(f"用户 {event.get_sender_id()} 添加了群 {group_id} 到监控列表。")
-        yield event.plain_result(f"成功开启！已将群 {group_id} 加入大脑监控列表。")
+        logger.info(f"用户 {event.get_sender_id()} 添加了群 {group_id} 到昵称显示列表。")
+
+        client = self._get_client_from_event(event)
+        if client:
+            try:
+                self_id = int(event.message_obj.self_id)
+                stats = await self.get_system_stats()
+                await self.update_nickname_for_group(client, group_id, self_id, stats)
+                yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表并立即更新昵称。")
+            except (AttributeError, ValueError):
+                yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表但无法获取机器人ID立即更新。")
+        else:
+            yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("大脑关闭")
+    @filter.command("昵称显示关闭")
     async def brain_off(self, event: AstrMessageEvent, group_id: str):
         if not group_id.isdigit():
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
         if group_id not in self.target_groups:
-            yield event.plain_result(f"群 {group_id} 不在监控列表中。")
+            yield event.plain_result(f"群 {group_id} 不在昵称显示列表中。")
             return
 
         self.target_groups.remove(group_id)
         await self._save_groups()
-        logger.info(f"用户 {event.get_sender_id()} 从监控列表移除了群 {group_id}。")
-        yield event.plain_result(f"操作成功！已将群 {group_id} 从大脑监控列表移除。")
+        logger.info(f"用户 {event.get_sender_id()} 从昵称显示列表移除了群 {group_id}。")
+
+        client = self._get_client_from_event(event)
+        if client:
+            try:
+                self_id = int(event.message_obj.self_id)
+                await self.cleanup_nickname_suffix(client, group_id, self_id)
+                yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除并立即清理昵称。")
+            except (AttributeError, ValueError):
+                yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除但无法获取机器人ID立即清理。")
+        else:
+            yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除。")
+
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("大脑更新")
+    @filter.command("刷新缓存")
+    async def brain_refresh(self, event: AstrMessageEvent):
+        """重新从文件加载配置并刷新当前群聊状态"""
+        logger.info(f"用户 {event.get_sender_id()} 触发了'刷新缓存'指令。")
+        await self._load_config()
+        await self._load_groups()
+
+        reply_msg = "缓存刷新成功！已重新加载群列表和显示配置。"
+
+        client = self._get_client_from_event(event)
+        group_id = event.get_group_id()
+        if client and group_id:
+            try:
+                self_id = int(event.message_obj.self_id)
+                stats = await self.get_system_stats()
+                if group_id in self.target_groups:
+                    await self.update_nickname_for_group(client, group_id, self_id, stats)
+                else:
+                    await self.cleanup_nickname_suffix(client, group_id, self_id)
+                reply_msg += "\n并已刷新当前群聊的昵称状态。"
+            except (AttributeError, ValueError):
+                reply_msg += "\n但无法获取机器人ID以刷新当前群聊昵称。"
+
+        yield event.plain_result(reply_msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("服务器更新")
     async def brain_update(self, event: AstrMessageEvent):
         client = self._get_client_from_event(event)
         if not client:
@@ -252,11 +323,11 @@ class ServerStatusPlugin(Star):
             yield event.plain_result("错误：无法获取机器人自身ID。")
             return
 
-        logger.info(f"用户 {event.get_sender_id()} 触发了'大脑更新'指令。")
+        logger.info(f"用户 {event.get_sender_id()} 触发了'服务器更新'指令。")
         stats = await self.get_system_stats()
         await self.update_db(stats)
         await self.update_all_nicknames(client, self_id, stats)
-        yield event.plain_result("大脑更新成功！已为所有受监控的群聊刷新状态。")
+        yield event.plain_result("服务器更新成功！已为所有受监控的群聊刷新昵称状态。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("理智记录")
@@ -422,11 +493,18 @@ class ServerStatusPlugin(Star):
 
         return str(filepath)
 
-
     def _sync_read_from_db(self, query: str) -> pd.DataFrame:
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql_query(query, conn)
             return df
+
+    async def _load_groups(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._sync_load_groups)
+
+    async def _load_config(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._sync_load_config)
 
     def _sync_load_groups(self):
         try:
