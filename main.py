@@ -21,11 +21,11 @@ from astrbot.api import logger
 
 
 @register(
-    "astrbot_plugin_server_status",
+    "astrbot_plugin_server_status_nickname",
     "DITF16",
     "通过群昵称动态显示服务器状态的插件，并提供状态历史图生成",
     "1.1",
-    "https://github.com/DITF16/astrbot_plugin_server_status"
+    "https://github.com/DITF16/astrbot_plugin_server_status_nickname"
 )
 class ServerStatusPlugin(Star):
     def __init__(self, context: Context):
