@@ -6,22 +6,27 @@ import json
 import uuid
 import asyncio
 from datetime import datetime, timedelta
-
 import pandas as pd
 import matplotlib
-from anyio import Path
+from pathlib import Path
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 
 
+@register(
+    "astrbot_plugin_server_status",
+    "DITF16",
+    "通过群昵称动态显示服务器状态的插件",
+    "1.0",
+    "https://github.com/DITF16/astrbot_plugin_server_status"
+)
 class ServerStatusPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -37,10 +42,6 @@ class ServerStatusPlugin(Star):
         self.font_path = self.font_dir / "font.ttf"
 
         self.tmp_dir.mkdir(exist_ok=True)
-
-        self.BOT_QQ_ID = "924558440"  # 临时的固定QQ号
-        # self.BOT_QQ_ID = "110624219"
-
         self.scheduler = None
         self.display_mode = "percent"
         self.target_groups = set()
@@ -110,14 +111,14 @@ class ServerStatusPlugin(Star):
             )
             conn.commit()
 
-
-    async def update_all_nicknames(self, client, stats: dict):
+    async def update_all_nicknames(self, client, self_id: int, stats: dict):
         if not self.target_groups:
             return
-        update_tasks = [self.update_nickname_for_group(client, group_id, stats) for group_id in self.target_groups]
+        update_tasks = [self.update_nickname_for_group(client, group_id, self_id, stats) for group_id in
+                        self.target_groups]
         await asyncio.gather(*update_tasks)
 
-    async def update_nickname_for_group(self, client, group_id: str, stats: dict):
+    async def update_nickname_for_group(self, client, group_id: str, self_id: int, stats: dict):
         if self.display_mode == 'percent':
             status_text = f"(理智使用{stats['cpu']:.1f}% 脑容量使用{stats['mem_percent']:.1f}%)"
         else:
@@ -126,7 +127,7 @@ class ServerStatusPlugin(Star):
             status_text = f"(理智使用{stats['cpu']:.1f}% 脑容量使用{mem_used_gb:.1f}G/{mem_total_gb:.1f}G)"
 
         try:
-            info_payload = {"group_id": int(group_id), "user_id": int(self.BOT_QQ_ID)}
+            info_payload = {"group_id": int(group_id), "user_id": self_id}
             member_info = await client.api.call_action('get_group_member_info', **info_payload)
             current_card = member_info.get('card', '')
 
@@ -140,7 +141,7 @@ class ServerStatusPlugin(Star):
             if new_card == current_card:
                 return
 
-            set_payload = {"group_id": int(group_id), "user_id": int(self.BOT_QQ_ID), "card": new_card}
+            set_payload = {"group_id": int(group_id), "user_id": self_id, "card": new_card}
 
             max_retries = 3
             for i in range(max_retries):
@@ -168,6 +169,12 @@ class ServerStatusPlugin(Star):
         if not client:
             return
 
+        try:
+            self_id = int(event.message_obj.self_id)
+        except (AttributeError, ValueError):
+            logger.error("无法从事件中获取有效的机器人自身ID (self_id)。")
+            return
+
         group_id = event.get_group_id()
         if group_id not in self.target_groups:
             return
@@ -181,7 +188,7 @@ class ServerStatusPlugin(Star):
         self.group_last_update_time[group_id] = now
 
         stats = await self.get_system_stats()
-        await self.update_nickname_for_group(client, group_id, stats)
+        await self.update_nickname_for_group(client, group_id, self_id, stats)
 
     async def scheduled_db_cleanup(self):
         try:
@@ -198,6 +205,7 @@ class ServerStatusPlugin(Star):
             cursor.execute("DELETE FROM status_records WHERE timestamp < ?", (ten_days_ago,))
             conn.commit()
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("大脑开启")
     async def brain_on(self, event: AstrMessageEvent, group_id: str):
         if not group_id.isdigit():
@@ -213,6 +221,7 @@ class ServerStatusPlugin(Star):
         logger.info(f"用户 {event.get_sender_id()} 添加了群 {group_id} 到监控列表。")
         yield event.plain_result(f"成功开启！已将群 {group_id} 加入大脑监控列表。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("大脑关闭")
     async def brain_off(self, event: AstrMessageEvent, group_id: str):
         if not group_id.isdigit():
@@ -228,6 +237,7 @@ class ServerStatusPlugin(Star):
         logger.info(f"用户 {event.get_sender_id()} 从监控列表移除了群 {group_id}。")
         yield event.plain_result(f"操作成功！已将群 {group_id} 从大脑监控列表移除。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("大脑更新")
     async def brain_update(self, event: AstrMessageEvent):
         client = self._get_client_from_event(event)
@@ -235,14 +245,22 @@ class ServerStatusPlugin(Star):
             yield event.plain_result("错误：当前平台不支持或无法获取客户端。")
             return
 
+        try:
+            self_id = int(event.message_obj.self_id)
+        except (AttributeError, ValueError):
+            logger.error("无法从事件中获取有效的机器人自身ID (self_id)。")
+            yield event.plain_result("错误：无法获取机器人自身ID。")
+            return
+
         logger.info(f"用户 {event.get_sender_id()} 触发了'大脑更新'指令。")
         stats = await self.get_system_stats()
         await self.update_db(stats)
-        await self.update_all_nicknames(client, stats)
+        await self.update_all_nicknames(client, self_id, stats)
         yield event.plain_result("大脑更新成功！已为所有受监控的群聊刷新状态。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("理智记录")
-    async def cpu_record(self, event: AstrMessageEvent, time_str: str):
+    async def cpu_record(self, event: AstrMessageEvent, time_str: str = "1小时"):
         image_path = None
         try:
             delta = self._parse_time_arg(time_str)
@@ -280,8 +298,9 @@ class ServerStatusPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片失败: {e}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("脑容量记录")
-    async def memory_record(self, event: AstrMessageEvent, time_str: str):
+    async def memory_record(self, event: AstrMessageEvent, time_str: str = "1小时"):
         image_path = None
         try:
             delta = self._parse_time_arg(time_str)
@@ -319,6 +338,7 @@ class ServerStatusPlugin(Star):
                 except OSError as e:
                     logger.error(f"删除临时图片失败: {e}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("改变脑容量显示")
     async def toggle_display_mode(self, event: AstrMessageEvent):
         if self.display_mode == 'percent':
@@ -335,12 +355,18 @@ class ServerStatusPlugin(Star):
 
         client = self._get_client_from_event(event)
         group_id = event.get_group_id()
+
         if client and group_id:
-            await self.update_nickname_for_group(client, group_id, stats)
+            try:
+                self_id = int(event.message_obj.self_id)
+                await self.update_nickname_for_group(client, group_id, self_id, stats)
+            except (AttributeError, ValueError):
+                logger.error("无法在'改变脑容量显示'中获取有效的机器人自身ID (self_id)。")
 
         yield event.plain_result(reply_text)
 
     def _get_client_from_event(self, event: AstrMessageEvent):
+        """安全地从事件中获取 aiocqhttp 平台的客户端对象。"""
         if event.get_platform_name() == "aiocqhttp":
             try:
                 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -377,7 +403,7 @@ class ServerStatusPlugin(Star):
             ax.set_xlabel("时间", fontsize=12, fontproperties=self.font_prop)
             ax.set_ylabel(ylabel, fontsize=12, fontproperties=self.font_prop)
             ax.legend(prop=self.font_prop)
-        else:  # Fallback if font is not found
+        else:
             ax.set_title(title, fontsize=16)
             ax.set_xlabel("Time", fontsize=12)
             ax.set_ylabel(ylabel, fontsize=12)
@@ -398,9 +424,6 @@ class ServerStatusPlugin(Star):
 
 
     def _sync_read_from_db(self, query: str) -> pd.DataFrame:
-        """
-        在当前线程建立新连接以读取数据库，保证线程安全。
-        """
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql_query(query, conn)
             return df
